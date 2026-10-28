@@ -1002,7 +1002,12 @@ jobs:
           gradle-version: '8.7'
 
       - name: Compilar APK
-        run: gradle assembleDebug --no-daemon
+        run: |
+          set -o pipefail
+          if ! gradle assembleDebug --no-daemon 2>&1 | tee build.log; then
+            grep -E "error:|warning: \[|What went wrong|FAILURE|Exception" -A2 build.log | head -40 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
 
       - name: Publicar APK para descargar
         env:
