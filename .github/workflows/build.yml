@@ -27,8 +27,8 @@ jobs:
                   applicationId "com.mario.vozghost"
                   minSdk 26
                   targetSdk 34
-                  versionCode 3
-                  versionName "1.2"
+                  versionCode 4
+                  versionName "1.3"
               }
 
               compileOptions {
@@ -105,6 +105,7 @@ jobs:
               public static volatile boolean running = false;
               public static volatile float level = 0f;
               public static volatile String error = null;
+              public static volatile String route = null;     // qué micro y qué salida se usan de verdad
 
               private Thread thread;
               private Context ctx;
@@ -164,7 +165,7 @@ jobs:
                               : MediaRecorder.AudioSource.MIC;
                       rec = openRecorder(sr, source);
                       if (rec == null) { sr = 44100; rec = openRecorder(sr, source); }
-                      if (rec == null) { rec = openRecorder(48000, MediaRecorder.AudioSource.MIC); sr = 48000; }
+                      if (rec == null && !useBt) { rec = openRecorder(48000, MediaRecorder.AudioSource.MIC); sr = 48000; }
                       if (rec == null) throw new IllegalStateException("No se pudo abrir el micrófono");
 
                       int minOut = AudioTrack.getMinBufferSize(sr, AudioFormat.CHANNEL_OUT_MONO,
@@ -212,6 +213,23 @@ jobs:
                       short[] cushion = new short[(int) (sr * 0.04)];
                       track.write(cushion, 0, cushion.length);
 
+                      // comprobar qué micro y qué salida ha elegido el móvil de verdad
+                      AudioDeviceInfo inDev = null, outDev = null;
+                      for (int t = 0; t < 25 && running; t++) {
+                          inDev = rec.getRoutedDevice();
+                          outDev = track.getRoutedDevice();
+                          if (inDev != null && (!useBt || inDev.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_SCO)) break;
+                          rec.read(inS, 0, frame);
+                          track.write(new short[frame], 0, frame);
+                          if (t % 5 == 4) Thread.sleep(100);
+                      }
+                      if (useBt && (inDev == null || inDev.getType() != AudioDeviceInfo.TYPE_BLUETOOTH_SCO)) {
+                          throw new IllegalStateException("Tu móvil no deja usar el micro de los auriculares "
+                                  + "y he evitado usar el suyo. Desactiva la opción de auriculares o prueba a "
+                                  + "reconectarlos.");
+                      }
+                      route = "Micro: " + name(inDev) + " · Sale por: " + name(outDev);
+
                       while (running) {
                           int n = rec.read(inS, 0, frame);
                           if (n <= 0) continue;
@@ -239,6 +257,7 @@ jobs:
                       error = e.getMessage() != null ? e.getMessage() : e.toString();
                   } finally {
                       running = false;
+                      route = null;
                       if (ns != null) ns.release();
                       if (aec != null) aec.release();
                       if (rec != null) { try { rec.stop(); } catch (Exception ignored) { } rec.release(); }
@@ -254,6 +273,22 @@ jobs:
                               am.setMode(AudioManager.MODE_NORMAL);
                           } catch (Exception ignored) { }
                       }
+                  }
+              }
+
+              private static String name(AudioDeviceInfo d) {
+                  if (d == null) return "desconocido";
+                  switch (d.getType()) {
+                      case AudioDeviceInfo.TYPE_BUILTIN_MIC: return "el del móvil";
+                      case AudioDeviceInfo.TYPE_BUILTIN_SPEAKER: return "altavoz del móvil";
+                      case AudioDeviceInfo.TYPE_BUILTIN_EARPIECE: return "auricular de llamadas del móvil";
+                      case AudioDeviceInfo.TYPE_BLUETOOTH_SCO:
+                      case AudioDeviceInfo.TYPE_BLUETOOTH_A2DP: return "Bluetooth (" + d.getProductName() + ")";
+                      case AudioDeviceInfo.TYPE_WIRED_HEADSET:
+                      case AudioDeviceInfo.TYPE_WIRED_HEADPHONES: return "auriculares con cable";
+                      case AudioDeviceInfo.TYPE_USB_HEADSET:
+                      case AudioDeviceInfo.TYPE_USB_DEVICE: return "USB (" + d.getProductName() + ")";
+                      default: return String.valueOf(d.getProductName());
                   }
               }
 
@@ -662,6 +697,8 @@ jobs:
                   public void run() {
                       boolean on = AudioEngine.running;
                       meter.setProgress(on ? Math.min(100, (int) (AudioEngine.level * 140)) : 0);
+                      String r = AudioEngine.route;
+                      if (on && r != null && !r.contentEquals(status.getText())) status.setText(r);
                       if (wantRunning && !on && AudioEngine.error != null) {
                           wantRunning = false;
                           stopService(new Intent(MainActivity.this, VoiceService.class));
