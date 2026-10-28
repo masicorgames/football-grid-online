@@ -27,8 +27,8 @@ jobs:
                   applicationId "com.mario.vozghost"
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 2
+                  versionName "1.1"
               }
 
               compileOptions {
@@ -80,6 +80,8 @@ jobs:
           import android.media.AudioRecord;
           import android.media.AudioTrack;
           import android.media.MediaRecorder;
+          import android.media.audiofx.AcousticEchoCanceler;
+          import android.media.audiofx.NoiseSuppressor;
           import android.os.Process;
 
           /** Micrófono -> GhostDsp -> altavoz/auriculares, en un hilo de audio de baja latencia. */
@@ -91,6 +93,7 @@ jobs:
               public static volatile float gateDb = -48f;
               public static volatile float outGain = 1.6f;
               public static volatile boolean phone = false;
+              public static volatile boolean cleanMic = true; // filtros del propio móvil contra ruido y acople
 
               public static volatile boolean running = false;
               public static volatile float level = 0f;
@@ -119,10 +122,15 @@ jobs:
                   Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
                   AudioRecord rec = null;
                   AudioTrack track = null;
+                  NoiseSuppressor ns = null;
+                  AcousticEchoCanceler aec = null;
                   try {
                       int sr = 48000;
-                      rec = openRecorder(sr);
-                      if (rec == null) { sr = 44100; rec = openRecorder(sr); }
+                      int source = cleanMic ? MediaRecorder.AudioSource.VOICE_COMMUNICATION
+                              : MediaRecorder.AudioSource.MIC;
+                      rec = openRecorder(sr, source);
+                      if (rec == null) { sr = 44100; rec = openRecorder(sr, source); }
+                      if (rec == null) { rec = openRecorder(48000, MediaRecorder.AudioSource.MIC); sr = 48000; }
                       if (rec == null) throw new IllegalStateException("No se pudo abrir el micrófono");
 
                       int minOut = AudioTrack.getMinBufferSize(sr, AudioFormat.CHANNEL_OUT_MONO,
@@ -137,7 +145,7 @@ jobs:
                                       .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                                       .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                                       .build())
-                              .setBufferSizeInBytes(Math.max(minOut * 2, 2048))
+                              .setBufferSizeInBytes(Math.max(minOut * 4, 8192))
                               .setTransferMode(AudioTrack.MODE_STREAM)
                               .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                               .build();
@@ -149,8 +157,23 @@ jobs:
                       float[] inF = new float[frame];
                       float[] outF = new float[frame];
 
+                      if (cleanMic) {
+                          int id = rec.getAudioSessionId();
+                          if (NoiseSuppressor.isAvailable()) {
+                              ns = NoiseSuppressor.create(id);
+                              if (ns != null) ns.setEnabled(true);
+                          }
+                          if (AcousticEchoCanceler.isAvailable()) {
+                              aec = AcousticEchoCanceler.create(id);
+                              if (aec != null) aec.setEnabled(true);
+                          }
+                      }
+
                       rec.startRecording();
                       track.play();
+                      // colchón de silencio para que el altavoz nunca se quede sin datos (evita crujidos)
+                      short[] cushion = new short[(int) (sr * 0.04)];
+                      track.write(cushion, 0, cushion.length);
 
                       while (running) {
                           int n = rec.read(inS, 0, frame);
@@ -179,16 +202,18 @@ jobs:
                       error = e.getMessage() != null ? e.getMessage() : e.toString();
                   } finally {
                       running = false;
+                      if (ns != null) ns.release();
+                      if (aec != null) aec.release();
                       if (rec != null) { try { rec.stop(); } catch (Exception ignored) { } rec.release(); }
                       if (track != null) { try { track.stop(); } catch (Exception ignored) { } track.release(); }
                   }
               }
 
-              private static AudioRecord openRecorder(int sr) {
+              private static AudioRecord openRecorder(int sr, int source) {
                   int min = AudioRecord.getMinBufferSize(sr, AudioFormat.CHANNEL_IN_MONO,
                           AudioFormat.ENCODING_PCM_16BIT);
                   if (min <= 0) return null;
-                  AudioRecord r = new AudioRecord(MediaRecorder.AudioSource.MIC, sr,
+                  AudioRecord r = new AudioRecord(source, sr,
                           AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, Math.max(min * 2, 2048));
                   if (r.getState() != AudioRecord.STATE_INITIALIZED) {
                       r.release();
@@ -204,70 +229,96 @@ jobs:
 
           /**
            * Procesado de voz estilo "Ghostface". Java puro (sin clases de Android) para poder probarlo.
-           * Cadena: filtro graves -> puerta de ruido -> bajada de tono (dos granos en línea de retardo)
-           * -> realce de pecho -> distorsión suave -> filtro "teléfono" opcional -> volumen.
+           * Cadena: filtro graves -> bajada de tono (WSOLA: los saltos se hacen donde la onda coincide,
+           * así no hay temblor) -> realce de pecho -> distorsión suave -> teléfono opcional
+           * -> puerta de ruido con histéresis -> volumen.
            */
           public final class GhostDsp {
 
               private final float sampleRate;
-              private final float[] ring = new float[16384];
-              private static final int MASK = 16383;
-              private int writePos = 0;
-              private float phase = 0f;
-              private final float grain;
 
-              public float semitones = -4f;   // bajada de tono
-              public float drive = 2f;        // distorsión (0 = limpia)
-              public float gateDb = -48f;     // umbral de la puerta de ruido
-              public float outGain = 1.6f;    // volumen final
-              public boolean phone = false;   // efecto teléfono
+              // --- bajada de tono ---
+              private static final int RING = 1 << 16;
+              private static final int RMASK = RING - 1;
+              private final float[] ring = new float[RING];
+              private long wAbs = 0;                 // muestras escritas
+              private final int L, H, S;             // grano, salto, margen de búsqueda
+              private final int targetLag, maxLag, minLag;
+              private final float[] win;
+              private final float[] tail, hopOut, grainBuf, target;
+              private int outPos;
+              private double pPrev = -1;             // inicio del grano anterior (posición absoluta)
+              private boolean started = false;
+              private float curRatio = 1f;
 
-              private final Biquad inHp, chest, phoneHp, phoneLp;
+              public float semitones = -4f;
+              public float drive = 2f;
+              public float gateDb = -48f;
+              public float outGain = 1.6f;
+              public boolean phone = false;
+
+              private final Biquad inHp, chest, hiss, phoneHp, phoneLp;
               private float env = 0f, gateGain = 0f;
+              private boolean gateOpen = false;
+              private int holdLeft = 0;
+              private final int holdSamples;
 
               public GhostDsp(float sampleRate) {
                   this.sampleRate = sampleRate;
-                  this.grain = 0.05f * sampleRate; // granos de 50 ms
+                  L = Math.round(0.040f * sampleRate) & ~1;   // 40 ms
+                  H = L / 2;                                   // 20 ms
+                  S = Math.round(0.011f * sampleRate);         // ±11 ms (cubre voces graves)
+                  targetLag = S + 32;
+                  maxLag = targetLag + 2 * S;
+                  minLag = 8;
+                  win = new float[L];
+                  for (int j = 0; j < L; j++) win[j] = (float) (0.5 - 0.5 * Math.cos(2 * Math.PI * j / L));
+                  tail = new float[H];
+                  hopOut = new float[H];
+                  grainBuf = new float[L];
+                  target = new float[H];
+                  outPos = 0;
+                  holdSamples = Math.round(0.18f * sampleRate);
+
                   inHp = Biquad.highpass(sampleRate, 90f, 0.707f);
                   chest = Biquad.peaking(sampleRate, 170f, 1.0f, 5f);
+                  hiss = Biquad.lowpass(sampleRate, 6000f, 0.707f);
                   phoneHp = Biquad.highpass(sampleRate, 380f, 0.8f);
                   phoneLp = Biquad.lowpass(sampleRate, 3000f, 0.9f);
               }
 
               public void process(float[] in, float[] out, int n) {
-                  final float ratio = (float) Math.pow(2.0, semitones / 12.0);
-                  final float inc = (1f - ratio) / grain;
                   final float k = drive;
                   final float norm = k > 0.05f ? (float) (1.0 / Math.tanh(k)) : 1f;
-                  final float gateLin = (float) Math.pow(10.0, gateDb / 20.0);
-                  final float attack = 1f - (float) Math.exp(-1.0 / (0.002 * sampleRate));
-                  final float release = 1f - (float) Math.exp(-1.0 / (0.120 * sampleRate));
-                  final float gateSmooth = 1f - (float) Math.exp(-1.0 / (0.015 * sampleRate));
+                  final float openLin = (float) Math.pow(10.0, gateDb / 20.0);
+                  final float closeLin = openLin * 0.5f;     // 6 dB de histéresis: no abre y cierra a lo loco
+                  final float attack = 1f - (float) Math.exp(-1.0 / (0.003 * sampleRate));
+                  final float release = 1f - (float) Math.exp(-1.0 / (0.080 * sampleRate));
+                  final float gateUp = 1f - (float) Math.exp(-1.0 / (0.008 * sampleRate));
+                  final float gateDown = 1f - (float) Math.exp(-1.0 / (0.060 * sampleRate));
+                  curRatio = (float) Math.pow(2.0, semitones / 12.0);
 
                   for (int i = 0; i < n; i++) {
-                      float x = inHp.process(in[i]);
+                      ring[(int) (wAbs & RMASK)] = inHp.process(in[i]);
+                      wAbs++;
 
-                      float a = Math.abs(x);
+                      if (outPos == H) { synthHop(); outPos = 0; }
+                      float y = hopOut[outPos++];
+
+                      // puerta de ruido sobre la voz ya transformada
+                      float a = Math.abs(y);
                       env += (a - env) * (a > env ? attack : release);
-                      float target = env > gateLin ? 1f : 0f;
-                      gateGain += (target - gateGain) * gateSmooth;
-
-                      ring[writePos] = x;
-
-                      phase += inc;
-                      if (phase >= 1f) phase -= 1f;
-                      if (phase < 0f) phase += 1f;
-                      float p2 = phase + 0.5f;
-                      if (p2 >= 1f) p2 -= 1f;
-
-                      float y = read(phase * grain) * window(phase) + read(p2 * grain) * window(p2);
-                      writePos = (writePos + 1) & MASK;
+                      if (env > openLin) { gateOpen = true; holdLeft = holdSamples; }
+                      else if (env < closeLin) {
+                          if (holdLeft > 0) holdLeft--; else gateOpen = false;
+                      }
+                      float g = gateOpen ? 1f : 0f;
+                      gateGain += (g - gateGain) * (g > gateGain ? gateUp : gateDown);
 
                       y = chest.process(y);
+                      y = hiss.process(y);
                       if (k > 0.05f) y = (float) Math.tanh(k * y) * norm;
-                      if (phone) {
-                          y = phoneLp.process(phoneHp.process(y)) * 1.8f;
-                      }
+                      if (phone) y = phoneLp.process(phoneHp.process(y)) * 1.8f;
                       y *= gateGain * outGain;
                       if (y > 1f) y = 1f;
                       else if (y < -1f) y = -1f;
@@ -275,18 +326,63 @@ jobs:
                   }
               }
 
-              private float read(float delay) {
-                  float pos = writePos - delay;
-                  int i0 = (int) Math.floor(pos);
-                  float frac = pos - i0;
-                  float s0 = ring[i0 & MASK];
-                  float s1 = ring[(i0 + 1) & MASK];
-                  return s0 + (s1 - s0) * frac;
+              /** Genera los siguientes H samples de salida (solapamiento al 50 % con ventana Hann). */
+              private void synthHop() {
+                  final double r = curRatio;
+                  if (!started) {
+                      if (wAbs < L * 2L + maxLag + S) { java.util.Arrays.fill(hopOut, 0f); return; }
+                      pPrev = wAbs - L * r - targetLag - H * r;
+                      started = true;
+                      java.util.Arrays.fill(tail, 0f);
+                  }
+
+                  double pNat = pPrev + H * r;                 // continuación perfecta
+                  double lag = wAbs - (pNat + L * r);          // margen que queda hasta lo último grabado
+                  double p = pNat;
+
+                  if (lag > maxLag || lag < minLag) {
+                      // hay que saltar: buscamos el punto donde la onda encaja con lo que estaba sonando
+                      for (int j = 0; j < H; j++) target[j] = read(pPrev + (H + j) * r);
+                      double center = wAbs - L * r - targetLag;
+                      int best = 0;
+                      double bestScore = -1e30;
+                      for (int d = -S; d <= S; d += 3) {
+                          double sc = score(center + d, r, 4);
+                          if (sc > bestScore) { bestScore = sc; best = d; }
+                      }
+                      int coarse = best;
+                      for (int d = coarse - 3; d <= coarse + 3; d++) {
+                          if (d < -S || d > S) continue;
+                          double sc = score(center + d, r, 1);
+                          if (sc > bestScore) { bestScore = sc; best = d; }
+                      }
+                      p = center + best;
+                  }
+
+                  for (int j = 0; j < L; j++) grainBuf[j] = read(p + j * r) * win[j];
+                  for (int j = 0; j < H; j++) {
+                      hopOut[j] = tail[j] + grainBuf[j];
+                      tail[j] = grainBuf[H + j];
+                  }
+                  pPrev = p;
               }
 
-              private static float window(float p) {
-                  float s = (float) Math.sin(Math.PI * p);
-                  return s * s;
+              private double score(double start, double r, int step) {
+                  double xy = 0, yy = 1e-9;
+                  for (int j = 0; j < H; j += step) {
+                      float c = read(start + j * r);
+                      xy += c * target[j];
+                      yy += c * c;
+                  }
+                  return xy / Math.sqrt(yy);
+              }
+
+              private float read(double pos) {
+                  long i0 = (long) Math.floor(pos);
+                  float frac = (float) (pos - i0);
+                  float s0 = ring[(int) (i0 & RMASK)];
+                  float s1 = ring[(int) ((i0 + 1) & RMASK)];
+                  return s0 + (s1 - s0) * frac;
               }
 
               /** Filtro biquad (fórmulas RBJ). */
@@ -370,10 +466,11 @@ jobs:
               private ProgressBar meter;
               private SeekBar pitchBar, driveBar, volBar, gateBar;
               private TextView pitchVal, driveVal, volVal, gateVal;
-              private Switch phoneSwitch;
+              private Switch phoneSwitch, cleanSwitch;
               private SharedPreferences prefs;
               private final Handler ui = new Handler(Looper.getMainLooper());
               private boolean wantRunning = false;
+              private boolean loading = true;
 
               @Override
               protected void onCreate(Bundle b) {
@@ -457,7 +554,18 @@ jobs:
                       AudioEngine.phone = on;
                       save();
                   });
-                  root.addView(phoneSwitch, lp(0, dp(8), 0, dp(24)));
+                  root.addView(phoneSwitch, lp(0, dp(8), 0, dp(8)));
+
+                  cleanSwitch = new Switch(this);
+                  cleanSwitch.setText("Filtro anti-ruido y anti-acople del móvil");
+                  cleanSwitch.setTextColor(TEXT);
+                  cleanSwitch.setTextSize(16);
+                  cleanSwitch.setOnCheckedChangeListener((s, on) -> {
+                      AudioEngine.cleanMic = on;
+                      save();
+                      if (AudioEngine.running) status.setText("Para y vuelve a activar la voz para aplicarlo");
+                  });
+                  root.addView(cleanSwitch, lp(0, dp(8), 0, dp(24)));
 
                   TextView tip = text("Consejo: usa auriculares o un altavoz Bluetooth escondido en el disfraz. "
                           + "Con el altavoz del propio móvil el micro se oye a sí mismo y pita. "
@@ -545,21 +653,30 @@ jobs:
               // ---------- ajustes guardados ----------
 
               private void load() {
-                  pitchBar.setProgress(prefs.getInt("pitch", 4));
-                  driveBar.setProgress(prefs.getInt("drive", 20));
-                  volBar.setProgress(prefs.getInt("vol", 160));
-                  gateBar.setProgress(prefs.getInt("gate", 22));
-                  phoneSwitch.setChecked(prefs.getBoolean("phone", false));
+                  loading = true;
+                  int pitch = prefs.getInt("pitch", 4), drive = prefs.getInt("drive", 20);
+                  int vol = prefs.getInt("vol", 160), gate = prefs.getInt("gate", 22);
+                  boolean phone = prefs.getBoolean("phone", false), clean = prefs.getBoolean("clean", true);
+                  pitchBar.setProgress(pitch);
+                  driveBar.setProgress(drive);
+                  volBar.setProgress(vol);
+                  gateBar.setProgress(gate);
+                  cleanSwitch.setChecked(clean);
+                  phoneSwitch.setChecked(phone);
+                  AudioEngine.cleanMic = cleanSwitch.isChecked();
                   AudioEngine.phone = phoneSwitch.isChecked();
+                  loading = false;
               }
 
               private void save() {
+                  if (loading) return;
                   prefs.edit()
                           .putInt("pitch", pitchBar.getProgress())
                           .putInt("drive", driveBar.getProgress())
                           .putInt("vol", volBar.getProgress())
                           .putInt("gate", gateBar.getProgress())
                           .putBoolean("phone", phoneSwitch.isChecked())
+                          .putBoolean("clean", cleanSwitch == null || cleanSwitch.isChecked())
                           .apply();
               }
 
