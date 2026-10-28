@@ -801,8 +801,6 @@ jobs:
                       driveBar.setProgress((int) (drive * 10));
                       volBar.setProgress(vol);
                       phoneSwitch.setChecked(phone);
-                  btSwitch.setChecked(bt);
-                  AudioEngine.btMic = bt;
                       save();
                   });
                   return b;
