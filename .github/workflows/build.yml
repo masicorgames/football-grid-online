@@ -27,8 +27,8 @@ jobs:
                   applicationId "com.mario.vozghost"
                   minSdk 26
                   targetSdk 34
-                  versionCode 2
-                  versionName "1.1"
+                  versionCode 3
+                  versionName "1.2"
               }
 
               compileOptions {
@@ -47,6 +47,8 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
 
               <application
                   android:label="Voz Ghost"
@@ -75,13 +77,17 @@ jobs:
           cat > 'app/src/main/java/com/mario/vozghost/AudioEngine.java' <<'GHOSTEOF'
           package com.mario.vozghost;
 
+          import android.content.Context;
           import android.media.AudioAttributes;
+          import android.media.AudioDeviceInfo;
+          import android.media.AudioManager;
           import android.media.AudioFormat;
           import android.media.AudioRecord;
           import android.media.AudioTrack;
           import android.media.MediaRecorder;
           import android.media.audiofx.AcousticEchoCanceler;
           import android.media.audiofx.NoiseSuppressor;
+          import android.os.Build;
           import android.os.Process;
 
           /** Micrófono -> GhostDsp -> altavoz/auriculares, en un hilo de audio de baja latencia. */
@@ -94,15 +100,18 @@ jobs:
               public static volatile float outGain = 1.6f;
               public static volatile boolean phone = false;
               public static volatile boolean cleanMic = true; // filtros del propio móvil contra ruido y acople
+              public static volatile boolean btMic = false;   // micro de auriculares Bluetooth, voz por el altavoz del móvil
 
               public static volatile boolean running = false;
               public static volatile float level = 0f;
               public static volatile String error = null;
 
               private Thread thread;
+              private Context ctx;
 
-              public synchronized void start() {
+              public synchronized void start(Context context) {
                   if (thread != null) return;
+                  ctx = context.getApplicationContext();
                   error = null;
                   running = true;
                   thread = new Thread(this::loop, "VozGhostAudio");
@@ -124,9 +133,34 @@ jobs:
                   AudioTrack track = null;
                   NoiseSuppressor ns = null;
                   AcousticEchoCanceler aec = null;
+                  AudioManager am = ctx.getSystemService(AudioManager.class);
+                  final boolean useBt = btMic;
                   try {
+                      AudioDeviceInfo btIn = null, speaker = null;
+                      if (useBt) {
+                          btIn = findBluetoothMic(am);
+                          if (btIn == null) throw new IllegalStateException(
+                                  "No encuentro el micro de los auriculares Bluetooth. ¿Están conectados al móvil?");
+                          am.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                          if (Build.VERSION.SDK_INT >= 31) {
+                              for (AudioDeviceInfo d : am.getAvailableCommunicationDevices()) {
+                                  if (d.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+                                      am.setCommunicationDevice(d);
+                                      break;
+                                  }
+                              }
+                          } else {
+                              am.startBluetoothSco();
+                              am.setBluetoothScoOn(true);
+                          }
+                          Thread.sleep(900); // el enlace de micro Bluetooth tarda un momento en abrirse
+                          for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                              if (d.getType() == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) speaker = d;
+                          }
+                      }
+
                       int sr = 48000;
-                      int source = cleanMic ? MediaRecorder.AudioSource.VOICE_COMMUNICATION
+                      int source = (cleanMic || useBt) ? MediaRecorder.AudioSource.VOICE_COMMUNICATION
                               : MediaRecorder.AudioSource.MIC;
                       rec = openRecorder(sr, source);
                       if (rec == null) { sr = 44100; rec = openRecorder(sr, source); }
@@ -169,6 +203,9 @@ jobs:
                           }
                       }
 
+                      if (btIn != null) rec.setPreferredDevice(btIn);
+                      if (speaker != null) track.setPreferredDevice(speaker);
+
                       rec.startRecording();
                       track.play();
                       // colchón de silencio para que el altavoz nunca se quede sin datos (evita crujidos)
@@ -206,7 +243,30 @@ jobs:
                       if (aec != null) aec.release();
                       if (rec != null) { try { rec.stop(); } catch (Exception ignored) { } rec.release(); }
                       if (track != null) { try { track.stop(); } catch (Exception ignored) { } track.release(); }
+                      if (useBt) {
+                          try {
+                              if (Build.VERSION.SDK_INT >= 31) {
+                                  am.clearCommunicationDevice();
+                              } else {
+                                  am.setBluetoothScoOn(false);
+                                  am.stopBluetoothSco();
+                              }
+                              am.setMode(AudioManager.MODE_NORMAL);
+                          } catch (Exception ignored) { }
+                      }
                   }
+              }
+
+              private static AudioDeviceInfo findBluetoothMic(AudioManager am) {
+                  for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
+                      if (d.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) return d;
+                  }
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      for (AudioDeviceInfo d : am.getAvailableCommunicationDevices()) {
+                          if (d.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) return d;
+                      }
+                  }
+                  return null;
               }
 
               private static AudioRecord openRecorder(int sr, int source) {
@@ -466,7 +526,7 @@ jobs:
               private ProgressBar meter;
               private SeekBar pitchBar, driveBar, volBar, gateBar;
               private TextView pitchVal, driveVal, volVal, gateVal;
-              private Switch phoneSwitch, cleanSwitch;
+              private Switch phoneSwitch, cleanSwitch, btSwitch;
               private SharedPreferences prefs;
               private final Handler ui = new Handler(Looper.getMainLooper());
               private boolean wantRunning = false;
@@ -565,10 +625,23 @@ jobs:
                       save();
                       if (AudioEngine.running) status.setText("Para y vuelve a activar la voz para aplicarlo");
                   });
-                  root.addView(cleanSwitch, lp(0, dp(8), 0, dp(24)));
+                  root.addView(cleanSwitch, lp(0, dp(8), 0, dp(8)));
 
-                  TextView tip = text("Consejo: usa auriculares o un altavoz Bluetooth escondido en el disfraz. "
-                          + "Con el altavoz del propio móvil el micro se oye a sí mismo y pita. "
+                  btSwitch = new Switch(this);
+                  btSwitch.setText("Micro de los auriculares Bluetooth (la voz sale por el altavoz del móvil)");
+                  btSwitch.setTextColor(TEXT);
+                  btSwitch.setTextSize(16);
+                  btSwitch.setOnCheckedChangeListener((s, on) -> {
+                      AudioEngine.btMic = on;
+                      save();
+                      if (AudioEngine.running) status.setText("Para y vuelve a activar la voz para aplicarlo");
+                  });
+                  root.addView(btSwitch, lp(0, dp(8), 0, dp(24)));
+
+                  TextView tip = text("Consejo: si usas el micro del propio móvil, saca la voz por un altavoz Bluetooth "
+                          + "separado del móvil; con el altavoz del móvil, el micro se oye a sí mismo y pita. "
+                          + "Con auriculares Bluetooth, activa la opción del micro de los auriculares y la voz "
+                          + "saldrá por el móvil. "
                           + "Para que suene más a la peli, habla despacio, grave y con pausas.", 13, MUTED);
                   tip.setLineSpacing(dp(3), 1f);
                   GradientDrawable tipBg = new GradientDrawable();
@@ -657,12 +730,15 @@ jobs:
                   int pitch = prefs.getInt("pitch", 4), drive = prefs.getInt("drive", 20);
                   int vol = prefs.getInt("vol", 160), gate = prefs.getInt("gate", 22);
                   boolean phone = prefs.getBoolean("phone", false), clean = prefs.getBoolean("clean", true);
+                  boolean bt = prefs.getBoolean("bt", false);
                   pitchBar.setProgress(pitch);
                   driveBar.setProgress(drive);
                   volBar.setProgress(vol);
                   gateBar.setProgress(gate);
                   cleanSwitch.setChecked(clean);
                   phoneSwitch.setChecked(phone);
+                  btSwitch.setChecked(bt);
+                  AudioEngine.btMic = bt;
                   AudioEngine.cleanMic = cleanSwitch.isChecked();
                   AudioEngine.phone = phoneSwitch.isChecked();
                   loading = false;
@@ -677,6 +753,7 @@ jobs:
                           .putInt("gate", gateBar.getProgress())
                           .putBoolean("phone", phoneSwitch.isChecked())
                           .putBoolean("clean", cleanSwitch == null || cleanSwitch.isChecked())
+                          .putBoolean("bt", btSwitch != null && btSwitch.isChecked())
                           .apply();
               }
 
@@ -724,6 +801,8 @@ jobs:
                       driveBar.setProgress((int) (drive * 10));
                       volBar.setProgress(vol);
                       phoneSwitch.setChecked(phone);
+                  btSwitch.setChecked(bt);
+                  AudioEngine.btMic = bt;
                       save();
                   });
                   return b;
@@ -830,7 +909,7 @@ jobs:
                       wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VozGhost:audio");
                       wakeLock.acquire(6 * 60 * 60 * 1000L); // máximo 6 horas de fiesta
                   }
-                  ENGINE.start();
+                  ENGINE.start(this);
                   return START_NOT_STICKY;
               }
 
