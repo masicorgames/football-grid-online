@@ -1,0 +1,819 @@
+name: Compilar Voz Ghost
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Crear el proyecto
+        run: |
+          mkdir -p "$(dirname 'app/build.gradle')"
+          cat > 'app/build.gradle' <<'GHOSTEOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.mario.vozghost'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.mario.vozghost"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          GHOSTEOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'GHOSTEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="Voz Ghost"
+                  android:icon="@mipmap/ic_launcher"
+                  android:theme="@android:style/Theme.Material.NoActionBar"
+                  android:allowBackup="false">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".VoiceService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+              </application>
+          </manifest>
+          GHOSTEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mario/vozghost/AudioEngine.java')"
+          cat > 'app/src/main/java/com/mario/vozghost/AudioEngine.java' <<'GHOSTEOF'
+          package com.mario.vozghost;
+
+          import android.media.AudioAttributes;
+          import android.media.AudioFormat;
+          import android.media.AudioRecord;
+          import android.media.AudioTrack;
+          import android.media.MediaRecorder;
+          import android.os.Process;
+
+          /** Micrófono -> GhostDsp -> altavoz/auriculares, en un hilo de audio de baja latencia. */
+          public final class AudioEngine {
+
+              // Ajustes compartidos con la interfaz
+              public static volatile float semitones = -4f;
+              public static volatile float drive = 2f;
+              public static volatile float gateDb = -48f;
+              public static volatile float outGain = 1.6f;
+              public static volatile boolean phone = false;
+
+              public static volatile boolean running = false;
+              public static volatile float level = 0f;
+              public static volatile String error = null;
+
+              private Thread thread;
+
+              public synchronized void start() {
+                  if (thread != null) return;
+                  error = null;
+                  running = true;
+                  thread = new Thread(this::loop, "VozGhostAudio");
+                  thread.start();
+              }
+
+              public synchronized void stop() {
+                  running = false;
+                  if (thread != null) {
+                      try { thread.join(1500); } catch (InterruptedException ignored) { }
+                      thread = null;
+                  }
+                  level = 0f;
+              }
+
+              private void loop() {
+                  Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
+                  AudioRecord rec = null;
+                  AudioTrack track = null;
+                  try {
+                      int sr = 48000;
+                      rec = openRecorder(sr);
+                      if (rec == null) { sr = 44100; rec = openRecorder(sr); }
+                      if (rec == null) throw new IllegalStateException("No se pudo abrir el micrófono");
+
+                      int minOut = AudioTrack.getMinBufferSize(sr, AudioFormat.CHANNEL_OUT_MONO,
+                              AudioFormat.ENCODING_PCM_16BIT);
+                      track = new AudioTrack.Builder()
+                              .setAudioAttributes(new AudioAttributes.Builder()
+                                      .setUsage(AudioAttributes.USAGE_MEDIA)
+                                      .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                      .build())
+                              .setAudioFormat(new AudioFormat.Builder()
+                                      .setSampleRate(sr)
+                                      .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                      .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                      .build())
+                              .setBufferSizeInBytes(Math.max(minOut * 2, 2048))
+                              .setTransferMode(AudioTrack.MODE_STREAM)
+                              .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                              .build();
+
+                      GhostDsp dsp = new GhostDsp(sr);
+                      final int frame = 256;
+                      short[] inS = new short[frame];
+                      short[] outS = new short[frame];
+                      float[] inF = new float[frame];
+                      float[] outF = new float[frame];
+
+                      rec.startRecording();
+                      track.play();
+
+                      while (running) {
+                          int n = rec.read(inS, 0, frame);
+                          if (n <= 0) continue;
+                          dsp.semitones = semitones;
+                          dsp.drive = drive;
+                          dsp.gateDb = gateDb;
+                          dsp.outGain = outGain;
+                          dsp.phone = phone;
+
+                          for (int i = 0; i < n; i++) inF[i] = inS[i] / 32768f;
+                          dsp.process(inF, outF, n);
+                          float peak = 0f;
+                          for (int i = 0; i < n; i++) {
+                              float v = outF[i];
+                              float av = Math.abs(v);
+                              if (av > peak) peak = av;
+                              outS[i] = (short) (v * 32767f);
+                          }
+                          level = level * 0.8f + peak * 0.2f;
+                          track.write(outS, 0, n);
+                      }
+                  } catch (SecurityException e) {
+                      error = "Falta el permiso del micrófono";
+                  } catch (Exception e) {
+                      error = e.getMessage() != null ? e.getMessage() : e.toString();
+                  } finally {
+                      running = false;
+                      if (rec != null) { try { rec.stop(); } catch (Exception ignored) { } rec.release(); }
+                      if (track != null) { try { track.stop(); } catch (Exception ignored) { } track.release(); }
+                  }
+              }
+
+              private static AudioRecord openRecorder(int sr) {
+                  int min = AudioRecord.getMinBufferSize(sr, AudioFormat.CHANNEL_IN_MONO,
+                          AudioFormat.ENCODING_PCM_16BIT);
+                  if (min <= 0) return null;
+                  AudioRecord r = new AudioRecord(MediaRecorder.AudioSource.MIC, sr,
+                          AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, Math.max(min * 2, 2048));
+                  if (r.getState() != AudioRecord.STATE_INITIALIZED) {
+                      r.release();
+                      return null;
+                  }
+                  return r;
+              }
+          }
+          GHOSTEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mario/vozghost/GhostDsp.java')"
+          cat > 'app/src/main/java/com/mario/vozghost/GhostDsp.java' <<'GHOSTEOF'
+          package com.mario.vozghost;
+
+          /**
+           * Procesado de voz estilo "Ghostface". Java puro (sin clases de Android) para poder probarlo.
+           * Cadena: filtro graves -> puerta de ruido -> bajada de tono (dos granos en línea de retardo)
+           * -> realce de pecho -> distorsión suave -> filtro "teléfono" opcional -> volumen.
+           */
+          public final class GhostDsp {
+
+              private final float sampleRate;
+              private final float[] ring = new float[16384];
+              private static final int MASK = 16383;
+              private int writePos = 0;
+              private float phase = 0f;
+              private final float grain;
+
+              public float semitones = -4f;   // bajada de tono
+              public float drive = 2f;        // distorsión (0 = limpia)
+              public float gateDb = -48f;     // umbral de la puerta de ruido
+              public float outGain = 1.6f;    // volumen final
+              public boolean phone = false;   // efecto teléfono
+
+              private final Biquad inHp, chest, phoneHp, phoneLp;
+              private float env = 0f, gateGain = 0f;
+
+              public GhostDsp(float sampleRate) {
+                  this.sampleRate = sampleRate;
+                  this.grain = 0.05f * sampleRate; // granos de 50 ms
+                  inHp = Biquad.highpass(sampleRate, 90f, 0.707f);
+                  chest = Biquad.peaking(sampleRate, 170f, 1.0f, 5f);
+                  phoneHp = Biquad.highpass(sampleRate, 380f, 0.8f);
+                  phoneLp = Biquad.lowpass(sampleRate, 3000f, 0.9f);
+              }
+
+              public void process(float[] in, float[] out, int n) {
+                  final float ratio = (float) Math.pow(2.0, semitones / 12.0);
+                  final float inc = (1f - ratio) / grain;
+                  final float k = drive;
+                  final float norm = k > 0.05f ? (float) (1.0 / Math.tanh(k)) : 1f;
+                  final float gateLin = (float) Math.pow(10.0, gateDb / 20.0);
+                  final float attack = 1f - (float) Math.exp(-1.0 / (0.002 * sampleRate));
+                  final float release = 1f - (float) Math.exp(-1.0 / (0.120 * sampleRate));
+                  final float gateSmooth = 1f - (float) Math.exp(-1.0 / (0.015 * sampleRate));
+
+                  for (int i = 0; i < n; i++) {
+                      float x = inHp.process(in[i]);
+
+                      float a = Math.abs(x);
+                      env += (a - env) * (a > env ? attack : release);
+                      float target = env > gateLin ? 1f : 0f;
+                      gateGain += (target - gateGain) * gateSmooth;
+
+                      ring[writePos] = x;
+
+                      phase += inc;
+                      if (phase >= 1f) phase -= 1f;
+                      if (phase < 0f) phase += 1f;
+                      float p2 = phase + 0.5f;
+                      if (p2 >= 1f) p2 -= 1f;
+
+                      float y = read(phase * grain) * window(phase) + read(p2 * grain) * window(p2);
+                      writePos = (writePos + 1) & MASK;
+
+                      y = chest.process(y);
+                      if (k > 0.05f) y = (float) Math.tanh(k * y) * norm;
+                      if (phone) {
+                          y = phoneLp.process(phoneHp.process(y)) * 1.8f;
+                      }
+                      y *= gateGain * outGain;
+                      if (y > 1f) y = 1f;
+                      else if (y < -1f) y = -1f;
+                      out[i] = y;
+                  }
+              }
+
+              private float read(float delay) {
+                  float pos = writePos - delay;
+                  int i0 = (int) Math.floor(pos);
+                  float frac = pos - i0;
+                  float s0 = ring[i0 & MASK];
+                  float s1 = ring[(i0 + 1) & MASK];
+                  return s0 + (s1 - s0) * frac;
+              }
+
+              private static float window(float p) {
+                  float s = (float) Math.sin(Math.PI * p);
+                  return s * s;
+              }
+
+              /** Filtro biquad (fórmulas RBJ). */
+              static final class Biquad {
+                  private final float b0, b1, b2, a1, a2;
+                  private float x1, x2, y1, y2;
+
+                  private Biquad(double b0, double b1, double b2, double a0, double a1, double a2) {
+                      this.b0 = (float) (b0 / a0);
+                      this.b1 = (float) (b1 / a0);
+                      this.b2 = (float) (b2 / a0);
+                      this.a1 = (float) (a1 / a0);
+                      this.a2 = (float) (a2 / a0);
+                  }
+
+                  static Biquad highpass(float sr, float f, float q) {
+                      double w = 2 * Math.PI * f / sr, c = Math.cos(w), al = Math.sin(w) / (2 * q);
+                      return new Biquad((1 + c) / 2, -(1 + c), (1 + c) / 2, 1 + al, -2 * c, 1 - al);
+                  }
+
+                  static Biquad lowpass(float sr, float f, float q) {
+                      double w = 2 * Math.PI * f / sr, c = Math.cos(w), al = Math.sin(w) / (2 * q);
+                      return new Biquad((1 - c) / 2, 1 - c, (1 - c) / 2, 1 + al, -2 * c, 1 - al);
+                  }
+
+                  static Biquad peaking(float sr, float f, float q, float gainDb) {
+                      double A = Math.pow(10, gainDb / 40.0);
+                      double w = 2 * Math.PI * f / sr, c = Math.cos(w), al = Math.sin(w) / (2 * q);
+                      return new Biquad(1 + al * A, -2 * c, 1 - al * A, 1 + al / A, -2 * c, 1 - al / A);
+                  }
+
+                  float process(float x) {
+                      float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+                      x2 = x1; x1 = x;
+                      y2 = y1; y1 = y;
+                      return y;
+                  }
+              }
+          }
+          GHOSTEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mario/vozghost/MainActivity.java')"
+          cat > 'app/src/main/java/com/mario/vozghost/MainActivity.java' <<'GHOSTEOF'
+          package com.mario.vozghost;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ProgressBar;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.Switch;
+          import android.widget.TextView;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class MainActivity extends Activity {
+
+              private static final int BG = Color.rgb(10, 10, 12);
+              private static final int PANEL = Color.rgb(24, 24, 28);
+              private static final int TEXT = Color.rgb(236, 236, 240);
+              private static final int MUTED = Color.rgb(150, 150, 160);
+              private static final int BLOOD = Color.rgb(200, 16, 32);
+
+              private Button toggle;
+              private TextView status;
+              private ProgressBar meter;
+              private SeekBar pitchBar, driveBar, volBar, gateBar;
+              private TextView pitchVal, driveVal, volVal, gateVal;
+              private Switch phoneSwitch;
+              private SharedPreferences prefs;
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private boolean wantRunning = false;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  getWindow().setStatusBarColor(BG);
+                  getWindow().setNavigationBarColor(BG);
+                  prefs = getSharedPreferences("ajustes", MODE_PRIVATE);
+
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setBackgroundColor(BG);
+                  scroll.setFillViewport(true);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(20), dp(28), dp(20), dp(28));
+                  scroll.addView(root);
+
+                  TextView title = text("VOZ GHOST", 34, TEXT);
+                  title.setTypeface(Typeface.create("sans-serif-condensed", Typeface.BOLD));
+                  title.setLetterSpacing(0.12f);
+                  root.addView(title);
+                  TextView sub = text("¿Cuál es tu película de miedo favorita?", 15, MUTED);
+                  sub.setTypeface(Typeface.create("serif", Typeface.ITALIC));
+                  root.addView(sub, lp(0, dp(4), 0, dp(24)));
+
+                  toggle = new Button(this);
+                  toggle.setTextSize(20);
+                  toggle.setTypeface(Typeface.DEFAULT_BOLD);
+                  toggle.setTextColor(Color.WHITE);
+                  toggle.setAllCaps(true);
+                  toggle.setOnClickListener(v -> onToggle());
+                  LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(72));
+                  root.addView(toggle, tp);
+
+                  status = text("", 14, MUTED);
+                  status.setGravity(Gravity.CENTER_HORIZONTAL);
+                  root.addView(status, lp(0, dp(10), 0, dp(6)));
+
+                  meter = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  meter.setMax(100);
+                  meter.setProgressTintList(android.content.res.ColorStateList.valueOf(BLOOD));
+                  meter.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(PANEL));
+                  root.addView(meter, lp(0, 0, 0, dp(24)));
+
+                  root.addView(section("Voces"));
+                  LinearLayout presets = new LinearLayout(this);
+                  presets.setOrientation(LinearLayout.HORIZONTAL);
+                  presets.addView(preset("Clásica", -4, 2.0f, 160, false), weight());
+                  presets.addView(preset("Teléfono", -3, 3.0f, 180, true), weight());
+                  presets.addView(preset("Demonio", -8, 5.0f, 170, false), weight());
+                  root.addView(presets, lp(0, 0, 0, dp(20)));
+
+                  root.addView(section("Ajustes"));
+                  pitchVal = new TextView(this);
+                  pitchBar = slider(root, "Tono", pitchVal, 12, (p) -> {
+                      AudioEngine.semitones = -p;
+                      pitchVal.setText(p == 0 ? "normal" : "−" + p + " semitonos");
+                  });
+                  driveVal = new TextView(this);
+                  driveBar = slider(root, "Distorsión", driveVal, 80, (p) -> {
+                      AudioEngine.drive = p / 10f;
+                      driveVal.setText(String.valueOf(p / 10f));
+                  });
+                  volVal = new TextView(this);
+                  volBar = slider(root, "Volumen", volVal, 300, (p) -> {
+                      AudioEngine.outGain = p / 100f;
+                      volVal.setText(p + " %");
+                  });
+                  gateVal = new TextView(this);
+                  gateBar = slider(root, "Silenciar ruido de fondo", gateVal, 40, (p) -> {
+                      AudioEngine.gateDb = -70f + p;
+                      gateVal.setText(p == 0 ? "apagado" : p < 15 ? "suave" : p < 28 ? "medio" : "fuerte");
+                  });
+
+                  phoneSwitch = new Switch(this);
+                  phoneSwitch.setText("Efecto teléfono");
+                  phoneSwitch.setTextColor(TEXT);
+                  phoneSwitch.setTextSize(16);
+                  phoneSwitch.setOnCheckedChangeListener((s, on) -> {
+                      AudioEngine.phone = on;
+                      save();
+                  });
+                  root.addView(phoneSwitch, lp(0, dp(8), 0, dp(24)));
+
+                  TextView tip = text("Consejo: usa auriculares o un altavoz Bluetooth escondido en el disfraz. "
+                          + "Con el altavoz del propio móvil el micro se oye a sí mismo y pita. "
+                          + "Para que suene más a la peli, habla despacio, grave y con pausas.", 13, MUTED);
+                  tip.setLineSpacing(dp(3), 1f);
+                  GradientDrawable tipBg = new GradientDrawable();
+                  tipBg.setColor(PANEL);
+                  tipBg.setCornerRadius(dp(10));
+                  tip.setBackground(tipBg);
+                  tip.setPadding(dp(14), dp(12), dp(14), dp(12));
+                  root.addView(tip);
+
+                  setContentView(scroll);
+                  load();
+                  refreshButton();
+                  ui.post(tick);
+              }
+
+              private final Runnable tick = new Runnable() {
+                  @Override
+                  public void run() {
+                      boolean on = AudioEngine.running;
+                      meter.setProgress(on ? Math.min(100, (int) (AudioEngine.level * 140)) : 0);
+                      if (wantRunning && !on && AudioEngine.error != null) {
+                          wantRunning = false;
+                          stopService(new Intent(MainActivity.this, VoiceService.class));
+                          status.setText("Error: " + AudioEngine.error);
+                          refreshButton();
+                      }
+                      ui.postDelayed(this, 50);
+                  }
+              };
+
+              private void onToggle() {
+                  if (wantRunning || AudioEngine.running) {
+                      wantRunning = false;
+                      stopService(new Intent(this, VoiceService.class));
+                      status.setText("Parada");
+                      refreshButton();
+                      return;
+                  }
+                  List<String> need = new ArrayList<>();
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      need.add(Manifest.permission.RECORD_AUDIO);
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                          != PackageManager.PERMISSION_GRANTED) {
+                      need.add(Manifest.permission.POST_NOTIFICATIONS);
+                  }
+                  if (need.contains(Manifest.permission.RECORD_AUDIO)) {
+                      requestPermissions(need.toArray(new String[0]), 7);
+                  } else {
+                      startVoice();
+                  }
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                      startVoice();
+                  } else {
+                      status.setText("Sin permiso de micrófono no puedo cambiarte la voz");
+                  }
+              }
+
+              private void startVoice() {
+                  wantRunning = true;
+                  AudioEngine.error = null;
+                  startForegroundService(new Intent(this, VoiceService.class));
+                  status.setText("Activa. Habla…");
+                  refreshButton();
+              }
+
+              private void refreshButton() {
+                  boolean on = wantRunning || AudioEngine.running;
+                  wantRunning = on;
+                  toggle.setText(on ? "Parar voz" : "Activar voz");
+                  GradientDrawable bg = new GradientDrawable();
+                  bg.setCornerRadius(dp(14));
+                  bg.setColor(on ? Color.rgb(60, 60, 66) : BLOOD);
+                  toggle.setBackground(bg);
+                  if (on && status.getText().length() == 0) status.setText("Activa. Habla…");
+              }
+
+              // ---------- ajustes guardados ----------
+
+              private void load() {
+                  pitchBar.setProgress(prefs.getInt("pitch", 4));
+                  driveBar.setProgress(prefs.getInt("drive", 20));
+                  volBar.setProgress(prefs.getInt("vol", 160));
+                  gateBar.setProgress(prefs.getInt("gate", 22));
+                  phoneSwitch.setChecked(prefs.getBoolean("phone", false));
+                  AudioEngine.phone = phoneSwitch.isChecked();
+              }
+
+              private void save() {
+                  prefs.edit()
+                          .putInt("pitch", pitchBar.getProgress())
+                          .putInt("drive", driveBar.getProgress())
+                          .putInt("vol", volBar.getProgress())
+                          .putInt("gate", gateBar.getProgress())
+                          .putBoolean("phone", phoneSwitch.isChecked())
+                          .apply();
+              }
+
+              // ---------- piezas de interfaz ----------
+
+              private interface OnValue { void set(int p); }
+
+              private SeekBar slider(LinearLayout root, String label, TextView value, int max, OnValue cb) {
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  TextView l = text(label, 15, TEXT);
+                  row.addView(l, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                  value.setTextColor(MUTED);
+                  value.setTextSize(14);
+                  row.addView(value);
+                  root.addView(row, lp(0, dp(6), 0, 0));
+
+                  SeekBar bar = new SeekBar(this);
+                  bar.setMax(max);
+                  bar.setProgressTintList(android.content.res.ColorStateList.valueOf(BLOOD));
+                  bar.setThumbTintList(android.content.res.ColorStateList.valueOf(TEXT));
+                  bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      public void onProgressChanged(SeekBar s, int p, boolean user) { cb.set(p); if (user) save(); }
+                      public void onStartTrackingTouch(SeekBar s) { }
+                      public void onStopTrackingTouch(SeekBar s) { }
+                  });
+                  root.addView(bar, lp(0, dp(4), 0, dp(12)));
+                  cb.set(bar.getProgress());
+                  return bar;
+              }
+
+              private Button preset(String name, int semis, float drive, int vol, boolean phone) {
+                  Button b = new Button(this);
+                  b.setText(name);
+                  b.setAllCaps(false);
+                  b.setTextColor(TEXT);
+                  b.setTextSize(15);
+                  GradientDrawable bg = new GradientDrawable();
+                  bg.setColor(PANEL);
+                  bg.setCornerRadius(dp(10));
+                  bg.setStroke(dp(1), Color.rgb(60, 60, 66));
+                  b.setBackground(bg);
+                  b.setOnClickListener(v -> {
+                      pitchBar.setProgress(-semis);
+                      driveBar.setProgress((int) (drive * 10));
+                      volBar.setProgress(vol);
+                      phoneSwitch.setChecked(phone);
+                      save();
+                  });
+                  return b;
+              }
+
+              private TextView section(String s) {
+                  TextView t = text(s.toUpperCase(), 12, MUTED);
+                  t.setLetterSpacing(0.15f);
+                  t.setTypeface(Typeface.DEFAULT_BOLD);
+                  t.setPadding(0, 0, 0, dp(10));
+                  return t;
+              }
+
+              private TextView text(String s, int sp, int color) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(sp);
+                  t.setTextColor(color);
+                  return t;
+              }
+
+              private LinearLayout.LayoutParams lp(int l, int t, int r, int bm) {
+                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                  p.setMargins(l, t, r, bm);
+                  return p;
+              }
+
+              private LinearLayout.LayoutParams weight() {
+                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(52), 1f);
+                  p.setMargins(dp(4), 0, dp(4), 0);
+                  return p;
+              }
+
+              private int dp(int v) {
+                  return Math.round(v * getResources().getDisplayMetrics().density);
+              }
+
+              @Override
+              protected void onDestroy() {
+                  ui.removeCallbacks(tick);
+                  super.onDestroy();
+              }
+          }
+          GHOSTEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mario/vozghost/VoiceService.java')"
+          cat > 'app/src/main/java/com/mario/vozghost/VoiceService.java' <<'GHOSTEOF'
+          package com.mario.vozghost;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.os.Build;
+          import android.os.IBinder;
+          import android.os.PowerManager;
+
+          /** Mantiene la voz funcionando con la pantalla apagada o el móvil en el bolsillo. */
+          public class VoiceService extends Service {
+
+              public static final String ACTION_STOP = "com.mario.vozghost.STOP";
+              private static final String CHANNEL = "voz";
+              private static final AudioEngine ENGINE = new AudioEngine();
+              private PowerManager.WakeLock wakeLock;
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+
+                  NotificationManager nm = getSystemService(NotificationManager.class);
+                  nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Voz activa",
+                          NotificationManager.IMPORTANCE_LOW));
+
+                  PendingIntent open = PendingIntent.getActivity(this, 0,
+                          new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
+                  PendingIntent stop = PendingIntent.getService(this, 1,
+                          new Intent(this, VoiceService.class).setAction(ACTION_STOP),
+                          PendingIntent.FLAG_IMMUTABLE);
+
+                  Notification n = new Notification.Builder(this, CHANNEL)
+                          .setSmallIcon(R.drawable.ic_mask)
+                          .setContentTitle("Voz Ghost activa")
+                          .setContentText("Tu voz se está transformando")
+                          .setContentIntent(open)
+                          .addAction(new Notification.Action.Builder(null, "Parar", stop).build())
+                          .setOngoing(true)
+                          .build();
+
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
+                  } else {
+                      startForeground(1, n);
+                  }
+
+                  if (wakeLock == null) {
+                      PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                      wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VozGhost:audio");
+                      wakeLock.acquire(6 * 60 * 60 * 1000L); // máximo 6 horas de fiesta
+                  }
+                  ENGINE.start();
+                  return START_NOT_STICKY;
+              }
+
+              @Override
+              public void onDestroy() {
+                  ENGINE.stop();
+                  if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                  wakeLock = null;
+                  super.onDestroy();
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+          }
+          GHOSTEOF
+          mkdir -p "$(dirname 'app/src/main/res/drawable/ic_launcher_fg.xml')"
+          cat > 'app/src/main/res/drawable/ic_launcher_fg.xml' <<'GHOSTEOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <group android:scaleX="0.8" android:scaleY="0.8" android:pivotX="54" android:pivotY="54">
+                  <path android:fillColor="#FFF2F2F2" android:fillType="evenOdd"
+                      android:pathData="M54,22C71,22 78,38 78,55C78,74 67,88 54,88C41,88 30,74 30,55C30,38 37,22 54,22Z M39,47C43,42 50,44 50,51C50,58 46,62 42,60C38,58 37,51 39,47Z M69,47C65,42 58,44 58,51C58,58 62,62 66,60C70,58 71,51 69,47Z M54,65C58,65 59,72 58,78C57,82 51,82 50,78C49,72 50,65 54,65Z" />
+              </group>
+          </vector>
+          GHOSTEOF
+          mkdir -p "$(dirname 'app/src/main/res/drawable/ic_mask.xml')"
+          cat > 'app/src/main/res/drawable/ic_mask.xml' <<'GHOSTEOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#FFFFFFFF" android:fillType="evenOdd"
+                  android:pathData="M54,22C71,22 78,38 78,55C78,74 67,88 54,88C41,88 30,74 30,55C30,38 37,22 54,22Z M39,47C43,42 50,44 50,51C50,58 46,62 42,60C38,58 37,51 39,47Z M69,47C65,42 58,44 58,51C58,58 62,62 66,60C70,58 71,51 69,47Z M54,65C58,65 59,72 58,78C57,82 51,82 50,78C49,72 50,65 54,65Z" />
+          </vector>
+          GHOSTEOF
+          mkdir -p "$(dirname 'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml')"
+          cat > 'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml' <<'GHOSTEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/launcher_bg" />
+              <foreground android:drawable="@drawable/ic_launcher_fg" />
+          </adaptive-icon>
+          GHOSTEOF
+          mkdir -p "$(dirname 'app/src/main/res/values/colors.xml')"
+          cat > 'app/src/main/res/values/colors.xml' <<'GHOSTEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="launcher_bg">#FF0A0A0C</color>
+          </resources>
+          GHOSTEOF
+          mkdir -p "$(dirname 'build.gradle')"
+          cat > 'build.gradle' <<'GHOSTEOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          GHOSTEOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'GHOSTEOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          GHOSTEOF
+          mkdir -p "$(dirname 'settings.gradle')"
+          cat > 'settings.gradle' <<'GHOSTEOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "VozGhost"
+          include ':app'
+          GHOSTEOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Compilar APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Publicar APK para descargar
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk VozGhost.apk
+          gh release create "v${{ github.run_number }}" VozGhost.apk \
+            --repo "${{ github.repository }}" \
+            --title "Voz Ghost ${{ github.run_number }}" \
+            --notes "Descarga VozGhost.apk en el móvil e instálalo."
