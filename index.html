@@ -840,4 +840,21 @@ function cpuSubs(t){
 </body>
 </html>
 
+<script>
+/* Aviso de expulsión (roja o doble amarilla): igual que el de lesión grave, solo si juega una persona en ese equipo */
+function redAlert(n,t,why,gk){
+  flash('🟥 ¡'+esc(n)+' expulsado!');
+  if(isCpu(t))return;
+  const d=document.createElement('div');d.className='injov';
+  d.innerHTML='<div class="injbox"><div class="injic">🟥</div><div class="injt">¡'+esc(n)+' ha sido expulsado!</div><div class="injs">'+esc(why[0].toUpperCase()+why.slice(1))+'. '+(gk?'Entra el portero suplente: debes retirar a un jugador de campo.':NAMES[t]+' sigue con un jugador menos.')+'</div><button class="injb">Continuar</button></div>';
+  d.querySelector('button').onclick=()=>d.remove();
+  document.body.appendChild(d);
+}
+const sendOff0=sendOff;
+sendOff=function(p,why){
+  const n=nm(p),t=p.t,gk=!!p.gk,subs=SUBS[t],on=P.includes(p);
+  sendOff0.apply(this,arguments);
+  if(gk?SUBS[t]>subs:on&&!P.includes(p))redAlert(n,t,why,gk);
+};
+</script>
 </body></html>
